@@ -70,7 +70,7 @@
 ### 2. 安装
 
 ```bash
-git clone https://github.com/your-username/deepresearch.git
+git clone https://github.com/seele430/DeepResearch.git
 cd deepresearch
 
 python -m venv venv
