@@ -185,3 +185,113 @@ MAX_READ = 8
 ### 后续可优化
 - 加 requests + BeautifulSoup 作为 trafilatura.extract 失败时的降级方案（优化 2）
 - 针对已知反爬站点做专门适配（优化 3）
+
+## 决策 006：ReAct 的实现范式——文本模板 vs 原生 Function Calling
+
+**日期**：2026-10-06（回顾性补记；循环实现定稿于 2026-09-26）
+
+**性质**：本文档为事后补记。补记原因：README 与简历中"基于 ReAct 模式 / 手写 ReAct 循环"的表述存在歧义——ReAct 有两种互不相同的工程落地范式，本项目实际只用了其中一种，而原始 5 份决策日志没有记录这次选型，容易被误读为另一种。
+
+### 背景
+
+ReAct（Reasoning + Acting）在工程上有两条路线，二者在**代码形态上差异极大**：
+
+**范式 A：文本 ReAct**（ReAct 论文原始形式，LangChain `hwchase17/react` 提示词模板的形态）
+
+模型被要求在提示词约束下输出固定格式的自由文本，程序用正则/字符串切分解析：
+
+```
+Thought: 我需要先了解 X 的基本情况
+Action: web_search
+Action Input: {"query": "X"}
+Observation: （由程序填入工具返回）
+```
+
+**范式 B：原生 Function Calling**（OpenAI tools API 及其兼容实现）
+
+工具以 JSON Schema 声明，模型返回结构化 `tool_calls`，程序无需解析任何自由文本：
+
+```json
+{"name": "web_search", "arguments": "{\"query\": \"X\"}"}
+```
+
+**本项目采用范式 B。** 代码中不含 `Thought`、`Action`、`Action Input`、`Observation` 任何一个字符串——这四个词是范式 A 的产物，不是本项目的实现细节。
+
+### 方案对比
+
+| 维度 | 范式 A：文本 ReAct | 范式 B：Function Calling（已采用） |
+|---|---|---|
+| Action 的产出形式 | 自由文本，需正则解析 | API 返回结构化 JSON |
+| 典型解析失败模式 | 参数带 markdown 代码块、中文全角冒号、漏写字段、Thought 与 Action 粘连、一次输出多个 Action、幻觉工具名 | 参数不符合 schema 时由 API 层直接暴露 |
+| 推理过程（Thought） | 明文可见，可审计、可用 few-shot 引导 | 模型内部隐式完成，不落文本 |
+| 模型兼容性 | 任何能对话的模型 | 需模型支持 `tools` |
+| 需要额外实现 | 提示词模板 + 解析器 + 容错重试 | 仅 JSON Schema 声明 |
+| 可观测性 | 高（推理链可直接读） | 低（需靠日志补偿） |
+| 主循环复杂度 | 高 | 低 |
+
+### 决策
+
+采用**范式 B（原生 Function Calling）**。
+
+### 理由
+
+1. **格式可靠性是 Agent 循环的生命线。** 主循环每一轮都要消费一次 Action，解析失败即整轮失效。范式 A 把"格式正确"交给模型自觉遵守提示词，范式 B 把它交给 API 的结构化约束——后者是结构性保证，不依赖模型当天的输出稳定性。
+2. **DeepSeek API 原生支持 `tools`，没有理由绕路。** 本项目的选型前提是"手写循环以理解 Agent 本质机制"，而不是"必须手写解析器"。手写解析器不增加对 Agent 的理解，只增加 bug 面。
+3. **减少一个解析器 = 减少一个失败面。** 去掉正则、容错、格式重试分支后，`agent.py` 的主循环维持在约 100 行，可读性显著提升。
+4. **代价被部分补偿。** 范式 B 牺牲了 Thought 的可观测性，但：
+   - `SYSTEM_PROMPT` 中的"工作原则 / 研究流程参考"承担了**引导推理顺序**的职责（多角度搜索 → 深入阅读 → 交叉验证 → 输出报告）；
+   - `rich` 打印的 `--- Step N ---`、工具名与参数、结果预览提供了**行为级**可观测性；
+   - 决策 002 / 003 的去重与次数上限逻辑都发生在**工具执行层**，不依赖模型输出的文本形态，因此换范式不受影响。
+
+### 核心代码：范式 A → 范式 B 的对应关系
+
+| ReAct 文本范式 | 本项目实现 | 位置 |
+|---|---|---|
+| Thought | `SYSTEM_PROMPT` 的工作原则 + 模型隐式推理 | `agent.py` `SYSTEM_PROMPT` |
+| Action | `msg.tool_calls[i].function.name` | `agent.py` 工具执行循环 |
+| Action Input | `json.loads(msg.tool_calls[i].function.arguments)` | 同上 |
+| Observation | `{"role": "tool", "tool_call_id": ..., "content": result}` | 工具结果回填处 |
+| 工具清单声明 | `TOOLS_SCHEMA`（JSON Schema） | `tools.py` 末尾 |
+| Final Answer | `if not msg.tool_calls: return msg.content` | 循环开头 |
+
+```python
+response = client.chat.completions.create(
+    model=MODEL,
+    messages=messages,
+    tools=TOOLS_SCHEMA,          # 工具以 schema 声明，而非写进 prompt 正文
+    tool_choice="auto",
+)
+msg = response.choices[0].message
+
+if not msg.tool_calls:           # 对应范式 A 的 "Final Answer:" 分支
+    console.print(Panel(msg.content, title="最终答案", border_style="green"))
+    return msg.content
+
+messages.append(msg)             # 必须回填原始 message 对象（含 tool_calls 字段）
+for tool_call in msg.tool_calls:
+    name = tool_call.function.name                          # 对应范式 A 的 Action
+    args = json.loads(tool_call.function.arguments)         # 对应范式 A 的 Action Input
+    ...
+    messages.append({                                       # 对应范式 A 的 Observation
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": str(result),
+    })
+```
+
+**一个易错点（实测）**：`messages.append(msg)` 必须追加**原始 message 对象**而不是手写的 dict。若把 `tool_calls` 字段丢掉，下一轮请求会因"tool 消息找不到对应的 tool_call_id"被 API 拒绝。
+
+### 什么情况下会切回范式 A
+
+- 目标模型不支持 `tools`（如部分本地小模型、旧版接口）；
+- 需要把推理过程作为**审计产物**输出（合规、教学、人在环审批场景）；
+- 需要用 few-shot 示例引导某种特殊推理格式——自由文本比 JSON Schema 更灵活。
+
+### 后续计划
+
+- [ ] 修正对外表述：将"基于 ReAct 模式"明确为"**ReAct 控制流 + 原生 Function Calling 实现**"，避免与范式 A 混淆
+- [ ] （可选）实现 `REACT_MODE=text|function_call` 双后端开关，用于对比两种范式的稳定性与格式崩坏率
+
+---
+
+**结论一句话**：本项目采用的是 ReAct 的**控制流**（推理 → 行动 → 观察循环），而不是 ReAct 的**文本格式**；Action / Action Input / Observation 由 API 的结构化工具调用承载，`Thought` 由系统提示词引导、不落文本。因此"手写 ReAct 循环"的准确含义是——**循环控制流是手写的，工具调用的序列化不是**。

@@ -1,6 +1,6 @@
 # DeepResearch
 
-> **一个基于 ReAct 模式的多步调研 Agent，能自主搜索、阅读、验证信息，并生成带引用来源的研究报告。**
+> **一个基于 ReAct 控制流的多步调研 Agent（手写循环 + 原生 Function Calling 实现），能自主搜索、阅读、验证信息，并生成带引用来源的研究报告。**
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -9,7 +9,7 @@
 
 ## ✨ Features / 特性
 
-- **🤖 自主决策**：基于 ReAct（Reasoning + Acting）模式，LLM 自主决定何时搜索、何时阅读、何时收尾
+- **🤖 自主决策**：采用 ReAct（Reasoning + Acting）的"推理 → 行动 → 观察"控制流，LLM 自主决定何时搜索、何时阅读、何时收尾。**循环控制流是手写的**（不依赖 LangChain / LangGraph），工具的序列化由 DeepSeek 原生 Function Calling 完成 —— 选型理由见 [决策 006](DECISIONS.md)
 - **🔍 多步调研**：不是"搜一次就答"，而是多角度搜索 + 深入阅读 + 交叉验证
 - **📝 带引用报告**：输出结构化研究报告，每条结论附来源链接
 - **🧠 自我反思**：主动识别信息矛盾，标注来源可信度，说明调研局限
@@ -71,7 +71,7 @@
 
 ```bash
 git clone https://github.com/seele430/DeepResearch.git
-cd deepresearch
+cd DeepResearch
 
 python -m venv venv
 # Windows
@@ -86,9 +86,14 @@ pip install -r requirements.txt
 
 ### 示例问题
 
+```text
+帮我调研 2025 年国产大模型的发展现状，重点对比 DeepSeek 和通义千问
+```
+
 ### 输出示例
 
-完整示例报告见 [examples/sample-report.md](examples/sample-report.md)。
+完整示例报告见 [examples/sample-report.md](examples/sample-report.md)
+（《2025 年国产大模型发展现状调研 —— DeepSeek vs 通义千问》）。
 
 节选：
 
@@ -113,6 +118,7 @@ pip install -r requirements.txt
 | 003 | 工具调用次数上限 | 防止失控，提示而非报错 |
 | 004 | 搜索上限的反思 | 次数上限只是症状缓解，病根在 read_url 失败率 |
 | 005 | read_url 添加 UA 伪装 | 解决 CSDN 等站点的反爬问题 |
+| 006 | ReAct 实现范式：文本模板 vs 原生 Function Calling | 格式可靠性 vs 推理过程可观测性 |
 
 **为什么记录决策？** 因为"做了什么"容易看到，"为什么这么做"才是工程价值的核心。
 
@@ -129,12 +135,12 @@ pip install -r requirements.txt
 | CLI 展示 | rich |
 | 配置 | python-dotenv |
 
-**说明**：本项目**不依赖 LangChain / LangGraph**，Agent 循环是手写的。目的是理解 Agent 的本质机制。
+**说明**：本项目**不依赖 LangChain / LangGraph**，Agent 循环（工具调度、去重、次数上限）是手写的。工具的声明与调用走 DeepSeek 原生 Function Calling，而不是提示词里的文本 Action 解析。目的是理解 Agent 的本质机制。
 
 ---
 ## 📁 Project Structure / 项目结构
 ```
-deepresearch/
+DeepResearch/
 ├── agent.py                # Agent 主循环（ReAct 实现）
 ├── tools.py                # 工具定义（搜索、阅读、保存）
 ├── requirements.txt        # 依赖列表
@@ -151,11 +157,13 @@ deepresearch/
 ---
 ## 🗺️ Roadmap / 后续计划
 
-- [ ] **阶段二**：Plan-and-Execute 模式（先规划后执行）
+- [x] **阶段二**：Plan-and-Execute 模式（先规划后执行）→ 已在 [ResearchSwarm](https://github.com/seele430/ResearchSwarm) 落地
 - [ ] **阶段二**：长期记忆系统（向量数据库）
-- [ ] **阶段三**：Multi-Agent 协作（Planner / Researcher / Analyst / Writer / Critic）
+- [x] **阶段三**：Multi-Agent 协作（Planner / Researcher / Analyst / Writer / Critic）→ 已在 [ResearchSwarm](https://github.com/seele430/ResearchSwarm) 落地（5 Agent 协作 + 并行调研 + Critic 反馈循环）
 - [ ] Web UI（Streamlit / FastAPI）
 - [ ] 打包为可执行文件（PyInstaller）
+
+> 阶段二/三的演进过程见 [ResearchSwarm](https://github.com/seele430/ResearchSwarm)：单 Agent → 多 Agent 的技术成长路径。
 
 ---
 ## 📄 License
