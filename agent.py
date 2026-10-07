@@ -1,12 +1,24 @@
+"""DeepResearch Agent 主循环 —— 双 ReAct 后端。
+
+两种后端并存，用同一套工具约束（ToolRuntime），便于对比：
+  * function_call —— 原生 Function Calling（决策 006 采纳，默认）
+  * text          —— 文本 ReAct（ReAct 论文原始形态，需正则解析）
+
+切换方式：
+  * 环境变量  REACT_MODE=text
+  * 运行时命令 /mode text 、 /mode function_call
+"""
+
 import os
 import json
-import hashlib
 from dotenv import load_dotenv
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 
-from tools import TOOLS_SCHEMA, TOOL_MAP
+from tools import TOOLS_SCHEMA
+from tool_runtime import ToolRuntime
+from react_parser import parse as parse_text_action
 
 load_dotenv()
 
@@ -16,6 +28,9 @@ client = OpenAI(
 )
 MODEL = os.getenv("LLM_MODEL")
 console = Console()
+
+# 默认后端：function_call | text
+REACT_MODE = os.getenv("REACT_MODE", "function_call").strip().lower()
 
 SYSTEM_PROMPT = """你是一个专业的研究助手 Agent。你的目标是帮用户完成**有深度、有依据**的调研任务。
 
@@ -36,40 +51,84 @@ SYSTEM_PROMPT = """你是一个专业的研究助手 Agent。你的目标是帮�
 先搜 1-2 次获取全局 → 阅读 2-3 个关键网页 → 如发现信息不足，再补充搜索 → 综合分析 → 输出报告
 """
 
-def _norm_query(q: str) -> str:
-    """标准化搜索关键词：转小写、去空格、去标点"""
-    q = q.lower().strip()
-    q = "".join(c for c in q if c.isalnum() or c.isspace())
-    return " ".join(q.split())
+
+# ---------------------------------------------------------------------------
+# 文本 ReAct（范式 A）的提示词
+# 工具手册从 TOOLS_SCHEMA 自动渲染，避免 prompt 与 schema 两处维护后漂移
+# ---------------------------------------------------------------------------
+_TEXT_REACT_TEMPLATE = """你是一个专业的研究助手 Agent，通过"思考 → 行动 → 观察"的循环完成调研任务。
+
+可用工具：
+{{TOOL_MANUAL}}
+
+## 输出格式（必须严格遵守）
+
+每一步只输出一个 Thought 和一个 Action，格式如下：
+
+Thought: <你的推理：当前缺什么信息、下一步该做什么>
+Action: <工具名>
+Action Input: <单行 JSON 参数对象>
+
+系统执行工具后，会以一行 "Observation: ..." 的形式把结果给你，然后你继续输出下一轮。
+
+当你已经收集到足够信息、可以回答用户问题时，用下面的格式收尾：
+
+Thought: 我已掌握足够信息
+Final Answer: <完整的研究报告，含来源链接>
+
+## 硬性要求
+
+1. Action Input 必须是**单行合法 JSON**，例如 {"query": "AI Agent 框架对比"}
+2. 不要自己编造 Observation —— 它由系统填写，你只负责 Thought 和 Action
+3. 一次输出里只能有一个 Action
+4. 至少进行 2-3 次不同角度的搜索；对最有价值的链接用 read_url 读正文，不要只看摘要
+5. 关键信息要在多个来源中交叉验证；来源冲突时在报告中明确指出
+6. Final Answer 要结构清晰：概况、细节、趋势、来源
+"""
 
 
-def _norm_url(url: str) -> str:
-    """标准化 URL：去掉末尾斜杠、去掉 #fragment"""
-    url = url.strip().rstrip("/")
-    if "#" in url:
-        url = url.split("#")[0]
-    return url
-    
-    
-def run_agent(user_query: str, max_steps: int = 10) -> str:
-    """Agent 主循环（含工具调用去重 + 次数限制）"""
+def _render_tool_manual():
+    """从 TOOLS_SCHEMA 渲染文本模式的工具手册。
+
+    这样工具清单只有一个真实来源（tools.py），
+    文本模式与 function calling 模式不会因为各自维护而漂移。
+    """
+    lines = []
+    for tool in TOOLS_SCHEMA:
+        fn = tool["function"]
+        spec = fn.get("parameters", {})
+        props = spec.get("properties", {})
+        required = set(spec.get("required", []))
+        params = ", ".join(
+            f"{name}: {meta.get('type', 'any')}" + ("" if name in required else "（可选）")
+            for name, meta in props.items()
+        )
+        lines.append(f"- {fn['name']}({params})：{fn['description']}")
+    return "\n".join(lines)
+
+
+TEXT_REACT_SYSTEM = _TEXT_REACT_TEMPLATE.replace("{{TOOL_MANUAL}}", _render_tool_manual())
+
+
+def _print_block_notice(runtime):
+    """把被去重/上限拦下的情况打印出来（两种后端共用）。"""
+    if runtime.last_status == "blocked_limit":
+        console.print(f"[red]⛔ {runtime.last_detail}[/red]")
+    elif runtime.last_status == "blocked_dup":
+        console.print(f"[magenta]⏭️  {runtime.last_detail}[/magenta]")
+
+
+# ---------------------------------------------------------------------------
+# 后端 1：原生 Function Calling（范式 B，默认）
+# ---------------------------------------------------------------------------
+def _run_function_call(user_query, max_steps, runtime):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_query},
     ]
 
-    # 去重记录
-    seen_queries = set()
-    read_cache = {}
-
-    # 工具调用计数
-    search_count = 0
-    read_count = 0
-    MAX_SEARCH = 5
-    MAX_READ = 8
-
     for step in range(max_steps):
-        console.print(f"\n[bold cyan]--- Step {step + 1} ---[/bold cyan]")
+        console.print(f"\n[bold cyan]--- Step {step + 1} (function_call) ---[/bold cyan]")
 
         response = client.chat.completions.create(
             model=MODEL,
@@ -86,7 +145,6 @@ def run_agent(user_query: str, max_steps: int = 10) -> str:
 
         messages.append(msg)
 
-        # 逐个执行工具
         for tool_call in msg.tool_calls:
             name = tool_call.function.name
             try:
@@ -95,73 +153,8 @@ def run_agent(user_query: str, max_steps: int = 10) -> str:
                 args = {}
 
             console.print(f"[yellow]🔧 调用工具:[/yellow] {name}({args})")
-
-            # ---------- 搜索工具 ----------
-            if name == "web_search":
-                if search_count >= MAX_SEARCH:
-                    console.print(f"[red]⛔ 已达搜索上限 {MAX_SEARCH} 次[/red]")
-                    result = f"[已达搜索上限 {MAX_SEARCH} 次] 请基于已有信息作答，或调用 read_url 深入阅读已搜到的链接。"
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    })
-                    continue
-
-                key = _norm_query(args.get("query", ""))
-                if key in seen_queries:
-                    console.print(f"[magenta]⏭️  跳过重复搜索:[/magenta] {key}")
-                    result = f"[已搜索过相似关键词] {args.get('query')}，请换一个更具体的词，或直接使用已有信息。"
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    })
-                    continue
-
-                seen_queries.add(key)
-                search_count += 1
-
-            # ---------- 阅读工具 ----------
-            elif name == "read_url":
-                if read_count >= MAX_READ:
-                    console.print(f"[red]⛔ 已达阅读上限 {MAX_READ} 次[/red]")
-                    result = f"[已达阅读上限 {MAX_READ} 次] 请基于已有信息作答。"
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    })
-                    continue
-
-                key = _norm_url(args.get("url", ""))
-                if key in read_cache:
-                    console.print(f"[magenta]⏭️  跳过重复阅读:[/magenta] {key}")
-                    result = f"[已读取过该网页] 内容如下：\n{read_cache[key]}"
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    })
-                    continue
-
-                read_count += 1
-
-            # ---------- 执行工具 ----------
-            func = TOOL_MAP.get(name)
-            if func is None:
-                result = f"未知工具: {name}"
-            else:
-                try:
-                    result = func(**args)
-                except Exception as e:
-                    result = f"工具执行失败: {e}"
-
-            # 缓存 read_url 的结果
-            if name == "read_url":
-                key = _norm_url(args.get("url", ""))
-                read_cache[key] = str(result)
-
+            result = runtime.execute(name, args)
+            _print_block_notice(runtime)
             console.print(f"[dim]结果预览: {str(result)[:200]}...[/dim]")
 
             messages.append({
@@ -173,8 +166,117 @@ def run_agent(user_query: str, max_steps: int = 10) -> str:
     console.print("[red]达到最大步数，强制结束[/red]")
     return "任务未完成"
 
+
+# ---------------------------------------------------------------------------
+# 后端 2：文本 ReAct（范式 A）—— 需要解析器，且解析会失败
+# ---------------------------------------------------------------------------
+def _run_text_react(user_query, max_steps, runtime):
+    messages = [
+        {"role": "system", "content": TEXT_REACT_SYSTEM},
+        {"role": "user", "content": f"Question: {user_query}"},
+    ]
+
+    attempts = 0        # 模型输出总轮数
+    failures = 0        # 其中解析失败的轮数
+    consecutive = 0     # 连续失败数
+
+    for step in range(max_steps):
+        console.print(f"\n[bold cyan]--- Step {step + 1} (text_react) ---[/bold cyan]")
+
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            # 让模型在"该收到 Observation"的位置停下，而不是自己往下编
+            stop=["\nObservation:", "\nObservation："],
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        messages.append({"role": "assistant", "content": raw})
+
+        attempts += 1
+        parsed = parse_text_action(raw)
+
+        # ---- 收尾 ----
+        if parsed.kind == "final":
+            console.print(Panel(parsed.final, title="最终答案", border_style="green"))
+            _report_text_stats(attempts, failures)
+            return parsed.final
+
+        # ---- 解析失败：范式 A 的固有失败面 ----
+        if parsed.kind == "error":
+            failures += 1
+            consecutive += 1
+            console.print(f"[red]⚠️  解析失败（{parsed.error}）[/red]")
+            console.print(f"[dim]原始输出: {raw[:200]}[/dim]")
+
+            if consecutive >= 3:
+                console.print("[red]连续 3 次格式解析失败，终止[/red]")
+                _report_text_stats(attempts, failures)
+                return "任务未完成：模型连续输出不符合 ReAct 格式"
+
+            # 把错误当 Observation 回喂，给模型一次自我修复的机会
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Observation: [格式错误] {parsed.error}。\n"
+                    "请严格按以下格式重新输出，不要输出任何多余内容：\n"
+                    "Thought: ...\n"
+                    "Action: 工具名\n"
+                    'Action Input: {"参数名": "值"}'
+                ),
+            })
+            continue
+
+        # ---- 工具调用 ----
+        consecutive = 0
+        if parsed.thought:
+            console.print(f"[dim]💭 Thought: {parsed.thought[:150]}[/dim]")
+        console.print(f"[yellow]🔧 调用工具:[/yellow] {parsed.action}({parsed.action_input})")
+
+        observation = runtime.execute(parsed.action, parsed.action_input)
+        _print_block_notice(runtime)
+        console.print(f"[dim]结果预览: {observation[:200]}...[/dim]")
+
+        messages.append({"role": "user", "content": f"Observation: {observation}"})
+
+    console.print("[red]达到最大步数，强制结束[/red]")
+    _report_text_stats(attempts, failures)
+    return "任务未完成"
+
+
+def _report_text_stats(attempts, failures):
+    if not attempts:
+        return
+    rate = failures / attempts * 100
+    console.print(
+        f"[bold]📊 文本模式格式解析：{attempts} 轮输出，{failures} 轮解析失败"
+        f"（崩坏率 {rate:.1f}%）[/bold]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 统一入口
+# ---------------------------------------------------------------------------
+def run_agent(user_query, max_steps=10, mode=None):
+    """Agent 主循环。mode: "function_call"（默认）或 "text"。"""
+    mode = (mode or REACT_MODE).strip().lower()
+    runtime = ToolRuntime()
+
+    if mode in ("text", "text_react", "react"):
+        answer = _run_text_react(user_query, max_steps, runtime)
+    else:
+        answer = _run_function_call(user_query, max_steps, runtime)
+
+    console.print(f"[dim]📈 {runtime.summary()}[/dim]")
+    return answer
+
+
 if __name__ == "__main__":
-    console.print("[bold green]🤖 研究助手 Agent 已启动（输入 exit 退出）[/bold green]")
+    console.print("[bold green]🤖 研究助手 Agent 已启动[/bold green]")
+    console.print(
+        f"[dim]ReAct 后端: {REACT_MODE}｜输入 /mode text 或 /mode function_call 切换，"
+        f"exit 退出[/dim]"
+    )
+
     while True:
         try:
             query = input("\n你的问题 > ").strip()
@@ -185,6 +287,15 @@ if __name__ == "__main__":
             continue
         if query.lower() in ("exit", "quit", "q"):
             break
+
+        if query.startswith("/mode"):
+            parts = query.split()
+            if len(parts) == 2 and parts[1] in ("text", "function_call"):
+                REACT_MODE = parts[1]
+                console.print(f"[green]已切换 ReAct 后端: {REACT_MODE}[/green]")
+            else:
+                console.print("[yellow]用法: /mode text  |  /mode function_call[/yellow]")
+            continue
 
         run_agent(query)
 
