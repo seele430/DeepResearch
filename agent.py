@@ -118,10 +118,33 @@ def _print_block_notice(runtime):
         console.print(f"[magenta]⏭️  {runtime.last_detail}[/magenta]")
 
 
+def _new_stats(mode):
+    """一轮 run 的统计骨架（供基准脚本采集，见 bench_react_backends.py）。"""
+    return {
+        "mode": mode,
+        "steps": 0,            # 实际走了几轮
+        "finished": False,     # 是否拿到最终答案
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "parse_attempts": 0,   # 仅 text 模式：模型输出轮数
+        "parse_failures": 0,   # 仅 text 模式：解析失败轮数
+    }
+
+
+def _record_usage(stats, response):
+    """累加 token 用量。stub / 假客户端没有 usage 时静默跳过。"""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    stats["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+    stats["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+
+
 # ---------------------------------------------------------------------------
 # 后端 1：原生 Function Calling（范式 B，默认）
 # ---------------------------------------------------------------------------
-def _run_function_call(user_query, max_steps, runtime):
+def _run_function_call(user_query, max_steps, runtime, stats):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_query},
@@ -136,11 +159,14 @@ def _run_function_call(user_query, max_steps, runtime):
             tools=TOOLS_SCHEMA,
             tool_choice="auto",
         )
+        _record_usage(stats, response)
+        stats["steps"] = step + 1
         msg = response.choices[0].message
 
         # 没有工具调用 → 输出最终答案
         if not msg.tool_calls:
             console.print(Panel(msg.content, title="最终答案", border_style="green"))
+            stats["finished"] = True
             return msg.content
 
         messages.append(msg)
@@ -170,7 +196,7 @@ def _run_function_call(user_query, max_steps, runtime):
 # ---------------------------------------------------------------------------
 # 后端 2：文本 ReAct（范式 A）—— 需要解析器，且解析会失败
 # ---------------------------------------------------------------------------
-def _run_text_react(user_query, max_steps, runtime):
+def _run_text_react(user_query, max_steps, runtime, stats):
     messages = [
         {"role": "system", "content": TEXT_REACT_SYSTEM},
         {"role": "user", "content": f"Question: {user_query}"},
@@ -189,15 +215,19 @@ def _run_text_react(user_query, max_steps, runtime):
             # 让模型在"该收到 Observation"的位置停下，而不是自己往下编
             stop=["\nObservation:", "\nObservation："],
         )
+        _record_usage(stats, response)
+        stats["steps"] = step + 1
         raw = (response.choices[0].message.content or "").strip()
         messages.append({"role": "assistant", "content": raw})
 
         attempts += 1
+        stats["parse_attempts"] = attempts
         parsed = parse_text_action(raw)
 
         # ---- 收尾 ----
         if parsed.kind == "final":
             console.print(Panel(parsed.final, title="最终答案", border_style="green"))
+            stats["finished"] = True
             _report_text_stats(attempts, failures)
             return parsed.final
 
@@ -205,6 +235,7 @@ def _run_text_react(user_query, max_steps, runtime):
         if parsed.kind == "error":
             failures += 1
             consecutive += 1
+            stats["parse_failures"] = failures
             console.print(f"[red]⚠️  解析失败（{parsed.error}）[/red]")
             console.print(f"[dim]原始输出: {raw[:200]}[/dim]")
 
@@ -256,15 +287,30 @@ def _report_text_stats(attempts, failures):
 # ---------------------------------------------------------------------------
 # 统一入口
 # ---------------------------------------------------------------------------
-def run_agent(user_query, max_steps=10, mode=None):
-    """Agent 主循环。mode: "function_call"（默认）或 "text"。"""
+def run_agent(user_query, max_steps=10, mode=None, stats=None):
+    """Agent 主循环。mode: "function_call"（默认）或 "text"。
+
+    stats: 传入一个 dict 会写入本轮统计（步数 / token / 解析失败数 / 工具调用），
+           供基准脚本 bench_react_backends.py 采集；不传则内部自行丢弃。
+    """
     mode = (mode or REACT_MODE).strip().lower()
     runtime = ToolRuntime()
+    if stats is None:
+        stats = _new_stats(mode)
+    else:
+        stats.update(_new_stats(mode))
 
     if mode in ("text", "text_react", "react"):
-        answer = _run_text_react(user_query, max_steps, runtime)
+        answer = _run_text_react(user_query, max_steps, runtime, stats)
     else:
-        answer = _run_function_call(user_query, max_steps, runtime)
+        answer = _run_function_call(user_query, max_steps, runtime, stats)
+
+    stats["tool_executed"] = runtime.stats["executed"]
+    stats["tool_blocked"] = runtime.stats["blocked"]
+    stats["tool_failed"] = runtime.stats["failed"]
+    stats["search_count"] = runtime.search_count
+    stats["read_count"] = runtime.read_count
+    stats["total_tokens"] = stats["prompt_tokens"] + stats["completion_tokens"]
 
     console.print(f"[dim]📈 {runtime.summary()}[/dim]")
     return answer

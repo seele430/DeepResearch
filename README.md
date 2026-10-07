@@ -138,6 +138,16 @@ python test_backend_loop.py     # 两种后端的循环控制流         22 项
 `test_tool_runtime.py` 是重构回归测试：证明把决策 002 / 003 的约束抽到
 `ToolRuntime` 之后，行为与原来完全一致。
 
+另外有一个**需要 API Key** 的基准脚本，用于测量两种后端的真实表现差异
+（完成率 / 步数 / token / 耗时 / 文本模式的真实解析失败率）：
+
+```bash
+python bench_react_backends.py --questions 5
+```
+
+产出 `bench_report.md`（可直接引用的对比表）与 `bench_raw.json`（逐条原始记录）。
+两种后端通过同一个 `run_agent(..., stats=...)` 采集指标，口径一致。
+
 ---
 ## 🧠 Design Decisions / 设计决策
 
@@ -189,6 +199,7 @@ DeepResearch/
 ├── test_react_parser.py    # 文本 ReAct 解析器鲁棒性测试
 ├── test_tool_runtime.py    # 去重 / 次数上限行为回归测试
 ├── test_backend_loop.py    # 双后端循环控制流 smoke test
+├── bench_react_backends.py # 双后端基准采样（需 API Key）
 ├── test_tools.py           # 工具测试
 └── test_read_url.py        # 网页抓取专项测试
 ```
