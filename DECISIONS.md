@@ -360,10 +360,33 @@ for tool_call in msg.tool_calls:
 
 这两类失败在范式 B 下都不存在：API 层会拒绝不符合 JSON Schema 的参数。
 
+### 实测数据（真实 API 采样，2026-10-07）
+
+用 `deepseek-chat` 对 5 个真实调研问题各跑一次（两种后端同题、同 `max_steps=8`、
+同 `ToolRuntime` 约束），完整数据见 [bench_report.md](bench_report.md) 与
+[bench_raw.json](bench_raw.json)。结果：
+
+| 指标 | `function_call` | `text` |
+|---|---|---|
+| 完成率 | **5/5** | **2/5** |
+| 平均工具调用 / 问 | 12.6 | 7.0 |
+| 平均 token / 问 | 47,832 | 31,558 |
+| 平均耗时 / 问 | 24.3s | 16.4s |
+| 格式解析失败率 | —（无解析器） | **0.0%（0/37 轮）** |
+
+**这个结果修正了上面的预期**：真实运行时文本 ReAct 的解析崩坏率是 **0**，
+而不是"会崩" —— deepseek-chat 遵守格式，且 `stop` 序列兜住了底。
+范式 A 真正的短板是**跑不完**：单步只能发一个 Action、信息收集慢，3/5 的
+问题在 8 步内没走到 Final Answer；范式 B 靠并行工具调用 100% 完成。
+
+> 口径提醒：5 问是**单次采样**、不含方差，结论是方向性的、非统计显著。
+
 ### 结论
 
 决策 006 的"格式可靠性更高"得到了**可复现证据**的支持，而不只是主观判断。
 同时明确了范式 A 的两个固有代价：失败时作废整轮步骤，且存在不报错的语义陷阱。
+真实采样进一步表明：**对强模型而言，文本 ReAct 的瓶颈从"解析崩坏"转移到了
+"单步单 Action 导致的信息吞吐不足"** —— 这是设计文本后端时没预料到的。
 
 ### 文件
 
@@ -380,4 +403,5 @@ for tool_call in msg.tool_calls:
 
 - [x] 修正 `requirements.txt`：补上 `tools.py` 直接 import 却未声明的
       `requests` / `beautifulsoup4` / `lxml`，移除无人使用的 `tavily-python`
-- [ ] 用真实 API 采样 N 个问题，统计两种范式的**真实**崩坏率、token 消耗与耗时
+- [x] 用真实 API 采样（2026-10-07，deepseek-chat，5 问 × 2 后端，max_steps=8）
+      → 结果见上表与 [bench_report.md](bench_report.md)

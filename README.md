@@ -148,6 +148,10 @@ python bench_react_backends.py --questions 5
 产出 `bench_report.md`（可直接引用的对比表）与 `bench_raw.json`（逐条原始记录）。
 两种后端通过同一个 `run_agent(..., stats=...)` 采集指标，口径一致。
 
+> **2026-10-07 实测**（deepseek-chat，5 问 × 2 后端）：完成率 function_call **5/5**
+> vs text **2/5**；文本后端解析失败率 **0%（0/37 轮）**，短板是单步单 Action、
+> 信息吞吐不足跑不完。完整数据见 [bench_report.md](bench_report.md)。
+
 ---
 ## 🧠 Design Decisions / 设计决策
 
@@ -210,7 +214,7 @@ DeepResearch/
 - [ ] **阶段二**：长期记忆系统（向量数据库）
 - [x] **阶段三**：Multi-Agent 协作（Planner / Researcher / Analyst / Writer / Critic）→ 已在 [ResearchSwarm](https://github.com/seele430/ResearchSwarm) 落地（5 Agent 协作 + 并行调研 + Critic 反馈循环）
 - [x] **双 ReAct 后端**：文本模板与原生 Function Calling 并存，可运行时切换对比
-- [ ] 用真实 API 采样，统计两种范式的真实崩坏率 / token 消耗 / 耗时
+- [x] 用真实 API 采样（5 问 × 2 后端，deepseek-chat）→ 结果见 [bench_report.md](bench_report.md)
 - [ ] Web UI（Streamlit / FastAPI）
 - [ ] 打包为可执行文件（PyInstaller）
 
